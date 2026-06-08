@@ -163,6 +163,7 @@ export interface CodexSessionVisibilityRepairItem {
   addedSessionIndexEntryCount: number;
   updatedSessionIndexEntryCount: number;
   updatedThreadProjectAssignmentCount: number;
+  updatedRecentWindowThreadCount: number;
   skippedSqliteFile: boolean;
   backupDir?: string | null;
   running: boolean;
@@ -176,6 +177,7 @@ export interface CodexSessionVisibilityRepairSummary {
   addedSessionIndexEntryCount: number;
   updatedSessionIndexEntryCount: number;
   updatedThreadProjectAssignmentCount: number;
+  updatedRecentWindowThreadCount: number;
   skippedSqliteFileCount: number;
   items: CodexSessionVisibilityRepairItem[];
   backupDirs: string[];

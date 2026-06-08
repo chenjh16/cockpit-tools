@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{TimeZone, Utc};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use toml_edit::Document;
@@ -26,6 +26,8 @@ const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const SESSION_VISIBILITY_REPAIR_BACKUP_PREFIX: &str = "backup-";
 const SESSION_VISIBILITY_REPAIR_BACKUP_SUFFIX: &str = "-session-visibility-repair";
 const MAX_SESSION_VISIBILITY_REPAIR_BACKUPS: usize = 1;
+const RECENT_CONVERSATION_PAGE_SIZE: usize = 50;
+const RECENT_CONVERSATION_REBALANCE_SCAN_LIMIT: usize = 15;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +40,7 @@ pub struct CodexSessionVisibilityRepairItem {
     pub added_session_index_entry_count: usize,
     pub updated_session_index_entry_count: usize,
     pub updated_thread_project_assignment_count: usize,
+    pub updated_recent_window_thread_count: usize,
     pub skipped_sqlite_file: bool,
     pub backup_dir: Option<String>,
     pub running: bool,
@@ -53,6 +56,7 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub added_session_index_entry_count: usize,
     pub updated_session_index_entry_count: usize,
     pub updated_thread_project_assignment_count: usize,
+    pub updated_recent_window_thread_count: usize,
     pub skipped_sqlite_file_count: usize,
     pub items: Vec<CodexSessionVisibilityRepairItem>,
     pub backup_dirs: Vec<String>,
@@ -83,6 +87,8 @@ struct SqliteProviderScan {
 
 #[derive(Debug, Clone, Copy)]
 struct ThreadsTableColumns {
+    updated_at: bool,
+    updated_at_ms: bool,
     model_provider: bool,
     has_user_event: bool,
     first_user_message: bool,
@@ -99,8 +105,17 @@ struct SqliteThreadIndexRow {
     archived: Option<i64>,
     first_user_message: Option<String>,
     thread_source: Option<String>,
+    has_updated_at_column: bool,
+    has_updated_at_ms_column: bool,
     has_first_user_message_column: bool,
     has_thread_source_column: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RecentWindowRebalanceChange {
+    thread_id: String,
+    updated_at: Option<i64>,
+    updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -127,6 +142,7 @@ pub fn repair_session_visibility_across_instances(
     let mut added_session_index_entry_count = 0usize;
     let mut updated_session_index_entry_count = 0usize;
     let mut updated_thread_project_assignment_count = 0usize;
+    let mut updated_recent_window_thread_count = 0usize;
     let mut skipped_sqlite_file_count = 0usize;
     let mut mutated_running_instance_count = 0usize;
 
@@ -144,10 +160,15 @@ pub fn repair_session_visibility_across_instances(
 
         let missing_thread_project_assignments =
             count_missing_thread_project_assignments(&instance.data_dir)?;
+        let recent_window_rows_to_rebalance =
+            count_recent_window_rows_to_rebalance(&instance.data_dir)?;
+        let reconcile_session_index =
+            session_index_drift.needs_repair() || recent_window_rows_to_rebalance > 0;
         if rollout_changes.is_empty()
             && sqlite_rows_to_update == 0
-            && !session_index_drift.needs_repair()
+            && !reconcile_session_index
             && missing_thread_project_assignments == 0
+            && recent_window_rows_to_rebalance == 0
         {
             items.push(CodexSessionVisibilityRepairItem {
                 instance_id: instance.id.clone(),
@@ -158,6 +179,7 @@ pub fn repair_session_visibility_across_instances(
                 added_session_index_entry_count: 0,
                 updated_session_index_entry_count: 0,
                 updated_thread_project_assignment_count: 0,
+                updated_recent_window_thread_count: 0,
                 skipped_sqlite_file: sqlite_scan.skipped_unusable_database,
                 backup_dir: None,
                 running,
@@ -168,8 +190,8 @@ pub fn repair_session_visibility_across_instances(
         let backup_dir = backup_instance_files(
             &instance.data_dir,
             &rollout_changes,
-            sqlite_rows_to_update > 0,
-            session_index_drift.needs_repair(),
+            sqlite_rows_to_update > 0 || recent_window_rows_to_rebalance > 0,
+            reconcile_session_index,
             missing_thread_project_assignments > 0,
             &instance.id,
             &target_provider,
@@ -181,21 +203,23 @@ pub fn repair_session_visibility_across_instances(
             &target_provider,
             &rollout_changes,
             sqlite_rows_to_update > 0,
-            session_index_drift.needs_repair(),
+            reconcile_session_index,
             missing_thread_project_assignments > 0,
+            recent_window_rows_to_rebalance > 0,
         );
         let (
             sqlite_rows_updated,
             session_index_entries_added,
             session_index_entries_updated,
             thread_project_assignments_updated,
+            recent_window_threads_updated,
         ) = match repaired {
             Ok(value) => value,
             Err(error) => {
                 let restore_result = restore_instance_files_from_backup(
                     &instance.data_dir,
                     &backup_dir,
-                    sqlite_rows_to_update > 0,
+                    sqlite_rows_to_update > 0 || recent_window_rows_to_rebalance > 0,
                     missing_thread_project_assignments > 0,
                 );
                 if let Err(restore_error) = restore_result {
@@ -222,6 +246,7 @@ pub fn repair_session_visibility_across_instances(
         added_session_index_entry_count += session_index_entries_added;
         updated_session_index_entry_count += session_index_entries_updated;
         updated_thread_project_assignment_count += thread_project_assignments_updated;
+        updated_recent_window_thread_count += recent_window_threads_updated;
         if running {
             mutated_running_instance_count += 1;
         }
@@ -235,6 +260,7 @@ pub fn repair_session_visibility_across_instances(
             added_session_index_entry_count: session_index_entries_added,
             updated_session_index_entry_count: session_index_entries_updated,
             updated_thread_project_assignment_count: thread_project_assignments_updated,
+            updated_recent_window_thread_count: recent_window_threads_updated,
             skipped_sqlite_file: sqlite_scan.skipped_unusable_database,
             backup_dir: Some(backup_dir_string),
             running,
@@ -250,6 +276,7 @@ pub fn repair_session_visibility_across_instances(
         added_session_index_entry_count,
         updated_session_index_entry_count,
         updated_thread_project_assignment_count,
+        updated_recent_window_thread_count,
         mutated_running_instance_count,
         skipped_sqlite_file_count,
     );
@@ -262,6 +289,7 @@ pub fn repair_session_visibility_across_instances(
         added_session_index_entry_count,
         updated_session_index_entry_count,
         updated_thread_project_assignment_count,
+        updated_recent_window_thread_count,
         skipped_sqlite_file_count,
         items,
         backup_dirs,
@@ -280,7 +308,8 @@ fn repair_single_instance(
     update_sqlite: bool,
     reconcile_session_index: bool,
     reconcile_project_assignments: bool,
-) -> Result<(usize, usize, usize, usize), String> {
+    rebalance_recent_window: bool,
+) -> Result<(usize, usize, usize, usize, usize), String> {
     let sqlite_rows_updated = if update_sqlite {
         update_sqlite_provider(data_dir, target_provider)?
     } else {
@@ -289,8 +318,13 @@ fn repair_single_instance(
     for change in rollout_changes {
         rewrite_rollout_provider(change)?;
     }
+    let recent_window_threads_updated = if rebalance_recent_window {
+        rebalance_recent_window_order(data_dir)?
+    } else {
+        0
+    };
     let (session_index_entries_added, session_index_entries_updated) = if reconcile_session_index {
-        reconcile_session_index_from_sqlite(data_dir)?
+        reconcile_session_index_from_sqlite(data_dir, rebalance_recent_window)?
     } else {
         (0, 0)
     };
@@ -304,6 +338,7 @@ fn repair_single_instance(
         session_index_entries_added,
         session_index_entries_updated,
         thread_project_assignments_updated,
+        recent_window_threads_updated,
     ))
 }
 
@@ -314,11 +349,12 @@ fn build_summary_message(
     added_session_index_entry_count: usize,
     updated_session_index_entry_count: usize,
     updated_thread_project_assignment_count: usize,
+    updated_recent_window_thread_count: usize,
     mutated_running_instance_count: usize,
     _skipped_sqlite_file_count: usize,
 ) -> String {
     if mutated_instance_count == 0 {
-        return "所有 Codex 实例的历史会话 provider 元数据与 session_index 已与当前 provider 一致，无需修复"
+        return "默认 Codex 实例的历史会话 provider 元数据、session_index 与最近会话窗口已一致，无需修复"
             .to_string();
     }
 
@@ -346,55 +382,46 @@ fn build_summary_message(
     } else {
         String::new()
     };
+    let recent_window_suffix = if updated_recent_window_thread_count > 0 {
+        format!(
+            "，调整 {} 条最近会话排序时间",
+            updated_recent_window_thread_count
+        )
+    } else {
+        String::new()
+    };
 
     if mutated_running_instance_count > 0 {
         return format!(
-            "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}。运行中的实例可能需要重启后显示",
-            mutated_instance_count,
+            "已为默认 Codex 实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}{}。运行中的实例可能需要重启后显示",
             changed_rollout_file_count,
             updated_sqlite_row_count,
             index_suffix,
             index_reorder_suffix,
-            assignment_suffix
+            assignment_suffix,
+            recent_window_suffix
         );
     }
 
     format!(
-        "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}",
-        mutated_instance_count,
+        "已为默认 Codex 实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}{}",
         changed_rollout_file_count,
         updated_sqlite_row_count,
         index_suffix,
         index_reorder_suffix,
-        assignment_suffix
+        assignment_suffix,
+        recent_window_suffix
     )
 }
 
 fn collect_instances() -> Result<Vec<CodexSyncInstance>, String> {
-    let mut instances = Vec::new();
     let default_dir = modules::codex_instance::get_default_codex_home()?;
-    let store = modules::codex_instance::load_instance_store()?;
-    instances.push(CodexSyncInstance {
+    Ok(vec![CodexSyncInstance {
         id: DEFAULT_INSTANCE_ID.to_string(),
         name: DEFAULT_INSTANCE_NAME.to_string(),
         data_dir: default_dir,
-        last_pid: store.default_settings.last_pid,
-    });
-
-    for instance in store.instances {
-        let user_data_dir = instance.user_data_dir.trim();
-        if user_data_dir.is_empty() {
-            continue;
-        }
-        instances.push(CodexSyncInstance {
-            id: instance.id,
-            name: instance.name,
-            data_dir: PathBuf::from(user_data_dir),
-            last_pid: instance.last_pid,
-        });
-    }
-
-    Ok(instances)
+        last_pid: None,
+    }])
 }
 
 fn is_instance_running(
@@ -822,6 +849,8 @@ fn load_sqlite_thread_index_rows(data_dir: &Path) -> Result<Vec<SqliteThreadInde
                 archived: row.get(5)?,
                 first_user_message: row.get(6)?,
                 thread_source: row.get(7)?,
+                has_updated_at_column: names.contains("updated_at"),
+                has_updated_at_ms_column: names.contains("updated_at_ms"),
                 has_first_user_message_column: names.contains("first_user_message"),
                 has_thread_source_column: names.contains("thread_source"),
             })
@@ -921,9 +950,12 @@ fn collect_session_index_visible_rows(
     Ok(rows)
 }
 
-fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<(usize, usize), String> {
+fn reconcile_session_index_from_sqlite(
+    data_dir: &Path,
+    force_rebuild_visible_tail: bool,
+) -> Result<(usize, usize), String> {
     let drift = count_session_index_drift(data_dir)?;
-    if !drift.needs_repair() {
+    if !force_rebuild_visible_tail && !drift.needs_repair() {
         return Ok((0, 0));
     }
 
@@ -969,7 +1001,12 @@ fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<(usize, usize)
             error
         )
     })?;
-    Ok((drift.missing_entries, drift.updated_entries))
+    let updated_entries = if force_rebuild_visible_tail && drift.updated_entries == 0 {
+        rows.len().saturating_sub(drift.missing_entries)
+    } else {
+        drift.updated_entries
+    };
+    Ok((drift.missing_entries, updated_entries))
 }
 
 fn is_user_visible_thread_row(row: &SqliteThreadIndexRow) -> bool {
@@ -1000,6 +1037,248 @@ fn collect_user_visible_thread_project_rows(
         .into_iter()
         .filter(is_user_visible_thread_row)
         .collect())
+}
+
+fn sorted_user_visible_thread_rows(data_dir: &Path) -> Result<Vec<SqliteThreadIndexRow>, String> {
+    let mut rows = collect_user_visible_thread_project_rows(data_dir)?;
+    rows.sort_by(|left, right| {
+        let left_time = thread_updated_at_ms_for_sort(left);
+        let right_time = thread_updated_at_ms_for_sort(right);
+        right_time
+            .cmp(&left_time)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(rows)
+}
+
+fn thread_updated_at_ms_for_sort(row: &SqliteThreadIndexRow) -> i128 {
+    row.updated_at_ms
+        .map(normalize_codex_timestamp_ms)
+        .or_else(|| row.updated_at.map(normalize_codex_timestamp_ms))
+        .unwrap_or_default()
+}
+
+fn build_recent_window_rebalance_plan(
+    rows: &[SqliteThreadIndexRow],
+) -> Vec<RecentWindowRebalanceChange> {
+    if rows.len() <= RECENT_CONVERSATION_PAGE_SIZE {
+        return Vec::new();
+    }
+
+    let scan_end = rows
+        .len()
+        .min(RECENT_CONVERSATION_PAGE_SIZE + RECENT_CONVERSATION_REBALANCE_SCAN_LIMIT);
+    let mut top_counts: HashMap<String, usize> = HashMap::new();
+    for cwd in rows
+        .iter()
+        .take(RECENT_CONVERSATION_PAGE_SIZE)
+        .filter_map(|row| row.cwd.as_deref().map(str::trim))
+        .filter(|cwd| !cwd.is_empty())
+    {
+        *top_counts.entry(cwd.to_string()).or_default() += 1;
+    }
+    if top_counts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped_rows = Vec::new();
+    let mut inserted_tail_ids = HashSet::new();
+    for top_row in rows.iter().take(RECENT_CONVERSATION_PAGE_SIZE) {
+        grouped_rows.push(top_row.clone());
+        let Some(cwd) = top_row
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+        else {
+            continue;
+        };
+        if top_counts.get(cwd).copied().unwrap_or_default() != 1 {
+            continue;
+        }
+        for tail_row in rows
+            .iter()
+            .skip(RECENT_CONVERSATION_PAGE_SIZE)
+            .take(RECENT_CONVERSATION_REBALANCE_SCAN_LIMIT)
+            .filter(|row| row.cwd.as_deref().map(str::trim) == Some(cwd))
+        {
+            if inserted_tail_ids.insert(tail_row.id.clone()) {
+                grouped_rows.push(tail_row.clone());
+            }
+        }
+    }
+    if inserted_tail_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let grouped_ids = grouped_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<HashSet<_>>();
+    for row in rows
+        .iter()
+        .take(scan_end)
+        .filter(|row| !grouped_ids.contains(&row.id))
+    {
+        grouped_rows.push(row.clone());
+    }
+
+    if grouped_rows.len() < 2 {
+        return Vec::new();
+    }
+
+    let original_ids = rows
+        .iter()
+        .take(grouped_rows.len())
+        .map(|row| row.id.as_str())
+        .collect::<Vec<_>>();
+    let next_ids = grouped_rows
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<Vec<_>>();
+    if original_ids == next_ids {
+        return Vec::new();
+    }
+
+    let base_time = rows
+        .first()
+        .map(thread_updated_at_ms_for_sort)
+        .unwrap_or_default();
+    grouped_rows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let next_ms = base_time - index as i128 * 1_000;
+            let next_ms = next_ms.max(0);
+            let current_ms = thread_updated_at_ms_for_sort(&row);
+            if current_ms == next_ms {
+                return None;
+            }
+
+            let updated_at_ms = if row.has_updated_at_ms_column {
+                Some(next_ms as i64)
+            } else {
+                None
+            };
+            let updated_at = if row.has_updated_at_column {
+                Some((next_ms / 1_000) as i64)
+            } else {
+                None
+            };
+            if updated_at_ms.is_none() && updated_at.is_none() {
+                return None;
+            }
+            Some(RecentWindowRebalanceChange {
+                thread_id: row.id,
+                updated_at,
+                updated_at_ms,
+            })
+        })
+        .collect()
+}
+
+fn count_recent_window_rows_to_rebalance(data_dir: &Path) -> Result<usize, String> {
+    let rows = sorted_user_visible_thread_rows(data_dir)?;
+    Ok(build_recent_window_rebalance_plan(&rows).len())
+}
+
+fn rebalance_recent_window_order(data_dir: &Path) -> Result<usize, String> {
+    let rows = sorted_user_visible_thread_rows(data_dir)?;
+    let changes = build_recent_window_rebalance_plan(&rows);
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let db_path = data_dir.join(STATE_DB_FILE);
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let mut connection = match Connection::open(&db_path) {
+        Ok(connection) => connection,
+        Err(error) if modules::db::is_unusable_sqlite_database_error(&error) => {
+            log_skipped_sqlite_database(&db_path, &error.to_string());
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!(
+                "打开实例数据库失败 ({}): {}",
+                db_path.display(),
+                error
+            ));
+        }
+    };
+    connection
+        .busy_timeout(Duration::from_secs(3))
+        .map_err(|error| {
+            format!(
+                "设置 SQLite busy_timeout 失败 ({}): {}",
+                db_path.display(),
+                error
+            )
+        })?;
+    let columns = match read_threads_table_columns(&connection) {
+        Ok(columns) => columns,
+        Err(error) if modules::db::is_unusable_sqlite_database_error(&error) => {
+            log_skipped_sqlite_database(&db_path, &error.to_string());
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format_sqlite_read_error(
+                &db_path,
+                "读取 SQLite threads 表结构失败",
+                &error,
+            ));
+        }
+    };
+    let Some(columns) = columns else {
+        return Ok(0);
+    };
+    if !columns.updated_at && !columns.updated_at_ms {
+        return Ok(0);
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format_sqlite_write_error(&db_path, &error))?;
+    let mut updated_rows = 0usize;
+    for change in &changes {
+        let update_result = match (columns.updated_at, columns.updated_at_ms) {
+            (true, true) => transaction.execute(
+                "UPDATE threads SET updated_at = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                params![
+                    change.updated_at.unwrap_or_default(),
+                    change.updated_at_ms.unwrap_or_default(),
+                    change.thread_id
+                ],
+            ),
+            (true, false) => transaction.execute(
+                "UPDATE threads SET updated_at = ?1 WHERE id = ?2",
+                params![change.updated_at.unwrap_or_default(), change.thread_id],
+            ),
+            (false, true) => transaction.execute(
+                "UPDATE threads SET updated_at_ms = ?1 WHERE id = ?2",
+                params![change.updated_at_ms.unwrap_or_default(), change.thread_id],
+            ),
+            (false, false) => Ok(0),
+        };
+        match update_result {
+            Ok(count) => updated_rows += count,
+            Err(error) if modules::db::is_unusable_sqlite_database_error(&error) => {
+                log_skipped_sqlite_database(&db_path, &error.to_string());
+                return Ok(updated_rows);
+            }
+            Err(error) if is_missing_threads_table_error(&error) => return Ok(updated_rows),
+            Err(error) => return Err(format_sqlite_write_error(&db_path, &error)),
+        }
+    }
+    if let Err(error) = transaction.commit() {
+        if modules::db::is_unusable_sqlite_database_error(&error) {
+            log_skipped_sqlite_database(&db_path, &error.to_string());
+            return Ok(updated_rows);
+        }
+        return Err(format_sqlite_write_error(&db_path, &error));
+    }
+    Ok(updated_rows)
 }
 
 fn global_state_path(data_dir: &Path) -> PathBuf {
@@ -1425,6 +1704,8 @@ fn read_threads_table_columns(
         return Ok(None);
     }
     Ok(Some(ThreadsTableColumns {
+        updated_at: names.contains("updated_at"),
+        updated_at_ms: names.contains("updated_at_ms"),
         model_provider: names.contains("model_provider"),
         has_user_event: names.contains("has_user_event"),
         first_user_message: names.contains("first_user_message"),
@@ -1974,7 +2255,7 @@ mod tests {
             collect_rollout_provider_changes(&data_dir, "relay").expect("collect rollout changes");
         assert_eq!(changes.len(), 1);
 
-        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false, false)
             .expect("repair rollout");
 
         let content = fs::read_to_string(&rollout_path).expect("read repaired rollout");
@@ -2009,7 +2290,7 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert!(changes[0].updated_first_line.is_none());
 
-        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false, false)
             .expect("repair rollout time");
 
         assert_eq!(
@@ -2047,7 +2328,7 @@ mod tests {
             .expect("updated first line")
             .contains("\"thread_source\":\"user\""));
 
-        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false, false)
             .expect("repair rollout thread source");
 
         let content = fs::read_to_string(&rollout_path).expect("read repaired rollout");
@@ -2273,7 +2554,7 @@ mod tests {
         assert_eq!(drift.updated_entries, 1);
 
         let (added, updated) =
-            reconcile_session_index_from_sqlite(&data_dir).expect("reconcile index");
+            reconcile_session_index_from_sqlite(&data_dir, false).expect("reconcile index");
         assert_eq!(added, 1);
         assert_eq!(updated, 1);
 
@@ -2321,6 +2602,60 @@ mod tests {
         assert!(!count_session_index_drift(&data_dir)
             .expect("recount index drift")
             .needs_repair());
+
+        fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn session_index_force_rebuild_refreshes_visible_thread_times() {
+        let data_dir = make_temp_dir("codex-session-visibility-index-force-test");
+        let db_path = data_dir.join(STATE_DB_FILE);
+        let connection = Connection::open(&db_path).expect("open sqlite");
+        connection
+            .execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    updated_at INTEGER,
+                    updated_at_ms INTEGER,
+                    cwd TEXT,
+                    archived INTEGER,
+                    first_user_message TEXT,
+                    thread_source TEXT
+                )",
+                [],
+            )
+            .expect("create threads table");
+        connection
+            .execute(
+                "INSERT INTO threads (id, title, updated_at, updated_at_ms, cwd, archived, first_user_message, thread_source)
+                 VALUES ('thread-1', 'Fresh title', 1_800_000_000, 1_800_000_000_123, '/tmp/project-a', 0, 'hello', 'user')",
+                [],
+            )
+            .expect("insert row");
+        drop(connection);
+
+        fs::write(
+            data_dir.join(SESSION_INDEX_FILE),
+            "{\"id\":\"thread-1\",\"thread_name\":\"Stale title\",\"updated_at\":\"2024-01-01T00:00:00.000000Z\"}\n",
+        )
+        .expect("write stale session index");
+
+        let (added, updated) =
+            reconcile_session_index_from_sqlite(&data_dir, true).expect("force rebuild index");
+        assert_eq!(added, 0);
+        assert_eq!(updated, 1);
+
+        let index_map = read_session_index_map(&data_dir).expect("read session index");
+        let entry = index_map.get("thread-1").expect("thread index entry");
+        assert_eq!(
+            entry.get("thread_name").and_then(JsonValue::as_str),
+            Some("Fresh title")
+        );
+        assert_eq!(
+            entry.get("updated_at").and_then(JsonValue::as_str),
+            Some("2027-01-15T08:00:00.123000Z")
+        );
 
         fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
     }
@@ -2392,6 +2727,95 @@ mod tests {
         assert_eq!(
             count_missing_thread_project_assignments(&data_dir)
                 .expect("recount missing project assignments"),
+            0
+        );
+
+        fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn recent_window_repair_groups_nearby_project_threads_once() {
+        let data_dir = make_temp_dir("codex-session-visibility-recent-window-test");
+        let db_path = data_dir.join(STATE_DB_FILE);
+        let connection = Connection::open(&db_path).expect("open sqlite");
+        connection
+            .execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    updated_at INTEGER,
+                    updated_at_ms INTEGER,
+                    cwd TEXT,
+                    archived INTEGER,
+                    first_user_message TEXT,
+                    thread_source TEXT
+                )",
+                [],
+            )
+            .expect("create threads table");
+
+        let base_ms = 1_800_000_000_000i64;
+        for index in 0..60 {
+            let cwd = if index == 40 {
+                "/tmp/ctrl-agent".to_string()
+            } else {
+                format!("/tmp/project-{index:02}")
+            };
+            let id = if index == 40 {
+                "ctrl-representative".to_string()
+            } else {
+                format!("project-{index:02}")
+            };
+            let updated_at_ms = base_ms - index * 1_000;
+            connection
+                .execute(
+                    "INSERT INTO threads (id, title, updated_at, updated_at_ms, cwd, archived, first_user_message, thread_source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 'hello', 'user')",
+                    params![
+                        id,
+                        format!("Thread {index}"),
+                        updated_at_ms / 1_000,
+                        updated_at_ms,
+                        cwd
+                    ],
+                )
+                .expect("insert representative");
+        }
+        for index in 0..5 {
+            let updated_at_ms = base_ms - (60 + index as i64) * 1_000;
+            connection
+                .execute(
+                    "INSERT INTO threads (id, title, updated_at, updated_at_ms, cwd, archived, first_user_message, thread_source)
+                     VALUES (?1, ?2, ?3, ?4, '/tmp/ctrl-agent', 0, 'hello', 'user')",
+                    params![
+                        format!("ctrl-extra-{index}"),
+                        format!("Ctrl extra {index}"),
+                        updated_at_ms / 1_000,
+                        updated_at_ms
+                    ],
+                )
+                .expect("insert extra ctrl thread");
+        }
+        drop(connection);
+
+        assert_eq!(
+            count_recent_window_rows_to_rebalance(&data_dir).expect("count rebalance rows"),
+            24
+        );
+        let updated = rebalance_recent_window_order(&data_dir).expect("rebalance recent window");
+        assert_eq!(updated, 24);
+
+        let rows = sorted_user_visible_thread_rows(&data_dir).expect("read sorted rows");
+        let ctrl_positions = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                (row.cwd.as_deref() == Some("/tmp/ctrl-agent")).then_some(index + 1)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ctrl_positions, vec![41, 42, 43, 44, 45, 46]);
+        assert_eq!(
+            count_recent_window_rows_to_rebalance(&data_dir).expect("recount rebalance rows"),
             0
         );
 

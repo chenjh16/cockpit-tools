@@ -2860,7 +2860,7 @@
         "title": "移到废纸篓",
         "message": "会将所选会话从对应实例中移到废纸篓，便于后续恢复；运行中的实例可能需要重启后才会反映。确认继续？",
         "syncMessage": "会将缺失的 rollout、session_index 条目和会话文件时间同步到所有实例，并触发官方 Codex 重建会话索引；已有内容不会重复写入，写入前会先备份目标文件。确认继续？",
-        "repairVisibilityMessage": "会按各实例 config.toml 根级 model_provider（缺失时按 openai）修复 rollout 文件与 state_5.sqlite 中的 provider 元数据，写入前会先备份将要修改的文件。运行中的实例可能需要重启后显示。确认继续？"
+        "repairVisibilityMessage": "会修复默认 Codex 实例 ~/.codex 的 rollout、state_5.sqlite、session_index 与项目归属数据，必要时调整最近会话排序时间；写入前会先备份将要修改的文件。运行中的 Codex App 可能需要重启后显示。确认继续？"
       },
       "empty": {
         "title": "还没有可管理的会话",
