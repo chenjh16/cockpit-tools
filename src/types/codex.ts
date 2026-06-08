@@ -161,6 +161,8 @@ export interface CodexSessionVisibilityRepairItem {
   changedRolloutFileCount: number;
   updatedSqliteRowCount: number;
   addedSessionIndexEntryCount: number;
+  updatedSessionIndexEntryCount: number;
+  updatedThreadProjectAssignmentCount: number;
   skippedSqliteFile: boolean;
   backupDir?: string | null;
   running: boolean;
@@ -172,6 +174,8 @@ export interface CodexSessionVisibilityRepairSummary {
   changedRolloutFileCount: number;
   updatedSqliteRowCount: number;
   addedSessionIndexEntryCount: number;
+  updatedSessionIndexEntryCount: number;
+  updatedThreadProjectAssignmentCount: number;
   skippedSqliteFileCount: number;
   items: CodexSessionVisibilityRepairItem[];
   backupDirs: string[];
