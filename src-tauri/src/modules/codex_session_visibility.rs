@@ -18,6 +18,10 @@ const DEFAULT_PROVIDER_ID: &str = "openai";
 const STATE_DB_FILE: &str = "state_5.sqlite";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
+const GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
+const THREAD_PROJECT_ASSIGNMENTS_KEY: &str = "thread-project-assignments";
+const PROJECT_ORDER_KEY: &str = "project-order";
+const ELECTRON_SAVED_WORKSPACE_ROOTS_KEY: &str = "electron-saved-workspace-roots";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const SESSION_VISIBILITY_REPAIR_BACKUP_PREFIX: &str = "backup-";
 const SESSION_VISIBILITY_REPAIR_BACKUP_SUFFIX: &str = "-session-visibility-repair";
@@ -32,6 +36,8 @@ pub struct CodexSessionVisibilityRepairItem {
     pub changed_rollout_file_count: usize,
     pub updated_sqlite_row_count: usize,
     pub added_session_index_entry_count: usize,
+    pub updated_session_index_entry_count: usize,
+    pub updated_thread_project_assignment_count: usize,
     pub skipped_sqlite_file: bool,
     pub backup_dir: Option<String>,
     pub running: bool,
@@ -45,6 +51,8 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub changed_rollout_file_count: usize,
     pub updated_sqlite_row_count: usize,
     pub added_session_index_entry_count: usize,
+    pub updated_session_index_entry_count: usize,
+    pub updated_thread_project_assignment_count: usize,
     pub skipped_sqlite_file_count: usize,
     pub items: Vec<CodexSessionVisibilityRepairItem>,
     pub backup_dirs: Vec<String>,
@@ -86,6 +94,25 @@ struct SqliteThreadIndexRow {
     id: String,
     title: String,
     updated_at: Option<i64>,
+    updated_at_ms: Option<i64>,
+    cwd: Option<String>,
+    archived: Option<i64>,
+    first_user_message: Option<String>,
+    thread_source: Option<String>,
+    has_first_user_message_column: bool,
+    has_thread_source_column: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionIndexDrift {
+    missing_entries: usize,
+    updated_entries: usize,
+}
+
+impl SessionIndexDrift {
+    fn needs_repair(self) -> bool {
+        self.missing_entries > 0 || self.updated_entries > 0
+    }
 }
 
 pub fn repair_session_visibility_across_instances(
@@ -98,6 +125,8 @@ pub fn repair_session_visibility_across_instances(
     let mut changed_rollout_file_count = 0usize;
     let mut updated_sqlite_row_count = 0usize;
     let mut added_session_index_entry_count = 0usize;
+    let mut updated_session_index_entry_count = 0usize;
+    let mut updated_thread_project_assignment_count = 0usize;
     let mut skipped_sqlite_file_count = 0usize;
     let mut mutated_running_instance_count = 0usize;
 
@@ -108,15 +137,17 @@ pub fn repair_session_visibility_across_instances(
             collect_rollout_provider_changes(&instance.data_dir, &target_provider)?;
         let sqlite_scan = count_sqlite_rows_to_update(&instance.data_dir, &target_provider)?;
         let sqlite_rows_to_update = sqlite_scan.rows_to_update;
-        let missing_session_index_entries =
-            count_missing_session_index_entries(&instance.data_dir)?;
+        let session_index_drift = count_session_index_drift(&instance.data_dir)?;
         if sqlite_scan.skipped_unusable_database {
             skipped_sqlite_file_count += 1;
         }
 
+        let missing_thread_project_assignments =
+            count_missing_thread_project_assignments(&instance.data_dir)?;
         if rollout_changes.is_empty()
             && sqlite_rows_to_update == 0
-            && missing_session_index_entries == 0
+            && !session_index_drift.needs_repair()
+            && missing_thread_project_assignments == 0
         {
             items.push(CodexSessionVisibilityRepairItem {
                 instance_id: instance.id.clone(),
@@ -125,6 +156,8 @@ pub fn repair_session_visibility_across_instances(
                 changed_rollout_file_count: 0,
                 updated_sqlite_row_count: 0,
                 added_session_index_entry_count: 0,
+                updated_session_index_entry_count: 0,
+                updated_thread_project_assignment_count: 0,
                 skipped_sqlite_file: sqlite_scan.skipped_unusable_database,
                 backup_dir: None,
                 running,
@@ -136,7 +169,8 @@ pub fn repair_session_visibility_across_instances(
             &instance.data_dir,
             &rollout_changes,
             sqlite_rows_to_update > 0,
-            missing_session_index_entries > 0,
+            session_index_drift.needs_repair(),
+            missing_thread_project_assignments > 0,
             &instance.id,
             &target_provider,
         )?;
@@ -147,15 +181,22 @@ pub fn repair_session_visibility_across_instances(
             &target_provider,
             &rollout_changes,
             sqlite_rows_to_update > 0,
-            missing_session_index_entries > 0,
+            session_index_drift.needs_repair(),
+            missing_thread_project_assignments > 0,
         );
-        let (sqlite_rows_updated, session_index_entries_added) = match repaired {
+        let (
+            sqlite_rows_updated,
+            session_index_entries_added,
+            session_index_entries_updated,
+            thread_project_assignments_updated,
+        ) = match repaired {
             Ok(value) => value,
             Err(error) => {
                 let restore_result = restore_instance_files_from_backup(
                     &instance.data_dir,
                     &backup_dir,
                     sqlite_rows_to_update > 0,
+                    missing_thread_project_assignments > 0,
                 );
                 if let Err(restore_error) = restore_result {
                     return Err(format!(
@@ -179,6 +220,8 @@ pub fn repair_session_visibility_across_instances(
         changed_rollout_file_count += rollout_changes.len();
         updated_sqlite_row_count += sqlite_rows_updated;
         added_session_index_entry_count += session_index_entries_added;
+        updated_session_index_entry_count += session_index_entries_updated;
+        updated_thread_project_assignment_count += thread_project_assignments_updated;
         if running {
             mutated_running_instance_count += 1;
         }
@@ -190,6 +233,8 @@ pub fn repair_session_visibility_across_instances(
             changed_rollout_file_count: rollout_changes.len(),
             updated_sqlite_row_count: sqlite_rows_updated,
             added_session_index_entry_count: session_index_entries_added,
+            updated_session_index_entry_count: session_index_entries_updated,
+            updated_thread_project_assignment_count: thread_project_assignments_updated,
             skipped_sqlite_file: sqlite_scan.skipped_unusable_database,
             backup_dir: Some(backup_dir_string),
             running,
@@ -203,6 +248,8 @@ pub fn repair_session_visibility_across_instances(
         changed_rollout_file_count,
         updated_sqlite_row_count,
         added_session_index_entry_count,
+        updated_session_index_entry_count,
+        updated_thread_project_assignment_count,
         mutated_running_instance_count,
         skipped_sqlite_file_count,
     );
@@ -213,6 +260,8 @@ pub fn repair_session_visibility_across_instances(
         changed_rollout_file_count,
         updated_sqlite_row_count,
         added_session_index_entry_count,
+        updated_session_index_entry_count,
+        updated_thread_project_assignment_count,
         skipped_sqlite_file_count,
         items,
         backup_dirs,
@@ -230,7 +279,8 @@ fn repair_single_instance(
     rollout_changes: &[RolloutProviderChange],
     update_sqlite: bool,
     reconcile_session_index: bool,
-) -> Result<(usize, usize), String> {
+    reconcile_project_assignments: bool,
+) -> Result<(usize, usize, usize, usize), String> {
     let sqlite_rows_updated = if update_sqlite {
         update_sqlite_provider(data_dir, target_provider)?
     } else {
@@ -239,12 +289,22 @@ fn repair_single_instance(
     for change in rollout_changes {
         rewrite_rollout_provider(change)?;
     }
-    let session_index_entries_added = if reconcile_session_index {
+    let (session_index_entries_added, session_index_entries_updated) = if reconcile_session_index {
         reconcile_session_index_from_sqlite(data_dir)?
+    } else {
+        (0, 0)
+    };
+    let thread_project_assignments_updated = if reconcile_project_assignments {
+        reconcile_thread_project_assignments(data_dir)?
     } else {
         0
     };
-    Ok((sqlite_rows_updated, session_index_entries_added))
+    Ok((
+        sqlite_rows_updated,
+        session_index_entries_added,
+        session_index_entries_updated,
+        thread_project_assignments_updated,
+    ))
 }
 
 fn build_summary_message(
@@ -252,6 +312,8 @@ fn build_summary_message(
     changed_rollout_file_count: usize,
     updated_sqlite_row_count: usize,
     added_session_index_entry_count: usize,
+    updated_session_index_entry_count: usize,
+    updated_thread_project_assignment_count: usize,
     mutated_running_instance_count: usize,
     _skipped_sqlite_file_count: usize,
 ) -> String {
@@ -268,20 +330,43 @@ fn build_summary_message(
     } else {
         String::new()
     };
+    let index_reorder_suffix = if updated_session_index_entry_count > 0 {
+        format!(
+            "，重排/更新 {} 条 session_index 记录",
+            updated_session_index_entry_count
+        )
+    } else {
+        String::new()
+    };
+    let assignment_suffix = if updated_thread_project_assignment_count > 0 {
+        format!(
+            "，补写 {} 条项目归属",
+            updated_thread_project_assignment_count
+        )
+    } else {
+        String::new()
+    };
 
     if mutated_running_instance_count > 0 {
         return format!(
-            "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}。运行中的实例可能需要重启后显示",
+            "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}。运行中的实例可能需要重启后显示",
             mutated_instance_count,
             changed_rollout_file_count,
             updated_sqlite_row_count,
-            index_suffix
+            index_suffix,
+            index_reorder_suffix,
+            assignment_suffix
         );
     }
 
     format!(
-        "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}",
-        mutated_instance_count, changed_rollout_file_count, updated_sqlite_row_count, index_suffix
+        "已为 {} 个实例修复历史会话可见性：改写 {} 个 rollout 文件，更新 {} 条 SQLite 记录{}{}{}",
+        mutated_instance_count,
+        changed_rollout_file_count,
+        updated_sqlite_row_count,
+        index_suffix,
+        index_reorder_suffix,
+        assignment_suffix
     )
 }
 
@@ -397,28 +482,38 @@ fn collect_rollout_provider_changes(
                 .and_then(JsonValue::as_str)
                 .unwrap_or("");
             let provider_matches = current_provider == target_provider;
+            let missing_user_thread_source = should_mark_rollout_thread_source_user(&parsed);
             let modified_time_matches = target_modified_at.is_none()
                 || modules::codex_session_file_time::same_modified_time_millis(
                     current_modified_at,
                     target_modified_at,
                 );
-            if provider_matches && modified_time_matches {
+            if provider_matches && !missing_user_thread_source && modified_time_matches {
                 continue;
             }
 
-            let updated_first_line = if provider_matches {
-                None
-            } else if let Some(payload) =
-                parsed.get_mut("payload").and_then(JsonValue::as_object_mut)
-            {
-                payload.insert(
-                    "model_provider".to_string(),
-                    JsonValue::String(target_provider.to_string()),
-                );
-                Some(
-                    serde_json::to_string(&parsed)
-                        .map_err(|error| format!("序列化 session_meta 失败: {}", error))?,
-                )
+            let updated_first_line = if !provider_matches || missing_user_thread_source {
+                if let Some(payload) = parsed.get_mut("payload").and_then(JsonValue::as_object_mut)
+                {
+                    if !provider_matches {
+                        payload.insert(
+                            "model_provider".to_string(),
+                            JsonValue::String(target_provider.to_string()),
+                        );
+                    }
+                    if missing_user_thread_source {
+                        payload.insert(
+                            "thread_source".to_string(),
+                            JsonValue::String("user".to_string()),
+                        );
+                    }
+                    Some(
+                        serde_json::to_string(&parsed)
+                            .map_err(|error| format!("序列化 session_meta 失败: {}", error))?,
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -437,6 +532,25 @@ fn collect_rollout_provider_changes(
 
     changes.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(changes)
+}
+
+fn should_mark_rollout_thread_source_user(meta: &JsonValue) -> bool {
+    let Some(payload) = meta.get("payload") else {
+        return false;
+    };
+    let existing_thread_source = payload
+        .get("thread_source")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !existing_thread_source.is_empty() {
+        return false;
+    }
+
+    matches!(
+        payload.get("source").and_then(JsonValue::as_str),
+        Some("cli" | "vscode" | "appServer")
+    )
 }
 
 fn list_rollout_files(root_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -559,12 +673,51 @@ fn read_session_index_map(root_dir: &Path) -> Result<HashMap<String, JsonValue>,
 }
 
 fn count_missing_session_index_entries(data_dir: &Path) -> Result<usize, String> {
+    Ok(count_session_index_drift(data_dir)?.missing_entries)
+}
+
+fn count_session_index_drift(data_dir: &Path) -> Result<SessionIndexDrift, String> {
     let session_index_map = read_session_index_map(data_dir)?;
-    let rows = load_sqlite_thread_index_rows(data_dir)?;
-    Ok(rows
+    let visible_rows = collect_session_index_visible_rows(data_dir)?;
+    if visible_rows.is_empty() {
+        return Ok(SessionIndexDrift::default());
+    }
+
+    let visible_ids = visible_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<HashSet<_>>();
+    let missing_entries = visible_rows
         .iter()
         .filter(|row| !session_index_map.contains_key(&row.id))
-        .count())
+        .count();
+    let existing_tail = read_session_index_lines(data_dir)?
+        .into_iter()
+        .filter_map(|line| serde_json::from_str::<JsonValue>(line.trim()).ok())
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .rev()
+        .filter(|id| visible_ids.contains(id))
+        .take(visible_rows.len())
+        .collect::<Vec<_>>();
+    let expected_tail = visible_rows
+        .iter()
+        .rev()
+        .map(|row| row.id.clone())
+        .collect::<Vec<_>>();
+    let mut updated_entries = 0usize;
+    if existing_tail != expected_tail {
+        updated_entries = visible_rows.len().saturating_sub(missing_entries);
+    }
+
+    Ok(SessionIndexDrift {
+        missing_entries,
+        updated_entries,
+    })
 }
 
 fn load_sqlite_thread_index_rows(data_dir: &Path) -> Result<Vec<SqliteThreadIndexRow>, String> {
@@ -624,8 +777,33 @@ fn load_sqlite_thread_index_rows(data_dir: &Path) -> Result<Vec<SqliteThreadInde
     } else {
         "NULL"
     };
+    let updated_at_ms_expr = if names.contains("updated_at_ms") {
+        "updated_at_ms"
+    } else {
+        "NULL"
+    };
+    let cwd_expr = if names.contains("cwd") {
+        "COALESCE(cwd, '')"
+    } else {
+        "''"
+    };
+    let archived_expr = if names.contains("archived") {
+        "archived"
+    } else {
+        "0"
+    };
+    let first_user_message_expr = if names.contains("first_user_message") {
+        "COALESCE(first_user_message, '')"
+    } else {
+        "''"
+    };
+    let thread_source_expr = if names.contains("thread_source") {
+        "COALESCE(thread_source, '')"
+    } else {
+        "''"
+    };
     let sql =
-        format!("SELECT id, {title_expr}, {updated_at_expr} FROM threads ORDER BY updated_at DESC");
+        format!("SELECT id, {title_expr}, {updated_at_expr}, {updated_at_ms_expr}, {cwd_expr}, {archived_expr}, {first_user_message_expr}, {thread_source_expr} FROM threads ORDER BY COALESCE({updated_at_ms_expr}, {updated_at_expr} * 1000, 0) DESC");
     let mut statement = connection.prepare(sql.as_str()).map_err(|error| {
         format!(
             "准备 SQLite 会话索引查询失败 ({}): {}",
@@ -639,6 +817,13 @@ fn load_sqlite_thread_index_rows(data_dir: &Path) -> Result<Vec<SqliteThreadInde
                 id: row.get(0)?,
                 title: row.get(1)?,
                 updated_at: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                cwd: row.get(4)?,
+                archived: row.get(5)?,
+                first_user_message: row.get(6)?,
+                thread_source: row.get(7)?,
+                has_first_user_message_column: names.contains("first_user_message"),
+                has_thread_source_column: names.contains("thread_source"),
             })
         })
         .map_err(|error| {
@@ -661,9 +846,15 @@ fn load_sqlite_thread_index_rows(data_dir: &Path) -> Result<Vec<SqliteThreadInde
     Ok(result)
 }
 
-fn format_thread_updated_at_iso(updated_at: Option<i64>) -> String {
-    let seconds = updated_at.unwrap_or_else(|| Utc::now().timestamp());
-    Utc.timestamp_opt(seconds, 0)
+fn format_thread_updated_at_iso_for_row(row: &SqliteThreadIndexRow) -> String {
+    let millis = row
+        .updated_at_ms
+        .map(normalize_codex_timestamp_ms)
+        .or_else(|| row.updated_at.map(normalize_codex_timestamp_ms))
+        .unwrap_or_else(|| Utc::now().timestamp_millis() as i128);
+    let seconds = (millis / 1_000) as i64;
+    let nanos = ((millis % 1_000).max(0) as u32) * 1_000_000;
+    Utc.timestamp_opt(seconds, nanos)
         .single()
         .unwrap_or_else(Utc::now)
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -677,43 +868,91 @@ fn build_session_index_entry_from_thread(row: &SqliteThreadIndexRow) -> JsonValu
         } else {
             row.title.as_str()
         },
-        "updated_at": format_thread_updated_at_iso(row.updated_at),
+        "updated_at": format_thread_updated_at_iso_for_row(row),
     })
 }
 
-fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<usize, String> {
-    let session_index_map = read_session_index_map(data_dir)?;
-    let rows = load_sqlite_thread_index_rows(data_dir)?;
-    let missing_rows: Vec<&SqliteThreadIndexRow> = rows
-        .iter()
-        .filter(|row| !session_index_map.contains_key(&row.id))
-        .collect();
-    if missing_rows.is_empty() {
-        return Ok(0);
+fn read_session_index_lines(data_dir: &Path) -> Result<Vec<String>, String> {
+    let path = data_dir.join(SESSION_INDEX_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_to_string(&path)
+        .map_err(|error| {
+            format!(
+                "读取 session_index.jsonl 失败 ({}): {}",
+                path.display(),
+                error
+            )
+        })?
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>())
+}
+
+fn collect_session_index_visible_rows(
+    data_dir: &Path,
+) -> Result<Vec<SqliteThreadIndexRow>, String> {
+    let mut rows = load_sqlite_thread_index_rows(data_dir)?
+        .into_iter()
+        .filter(|row| {
+            if row.has_first_user_message_column || row.has_thread_source_column {
+                is_user_visible_thread_row(row)
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let left_time = left
+            .updated_at_ms
+            .map(normalize_codex_timestamp_ms)
+            .or_else(|| left.updated_at.map(normalize_codex_timestamp_ms))
+            .unwrap_or_default();
+        let right_time = right
+            .updated_at_ms
+            .map(normalize_codex_timestamp_ms)
+            .or_else(|| right.updated_at.map(normalize_codex_timestamp_ms))
+            .unwrap_or_default();
+        left_time
+            .cmp(&right_time)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(rows)
+}
+
+fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<(usize, usize), String> {
+    let drift = count_session_index_drift(data_dir)?;
+    if !drift.needs_repair() {
+        return Ok((0, 0));
     }
 
-    let path = data_dir.join(SESSION_INDEX_FILE);
-    let mut lines = if path.exists() {
-        fs::read_to_string(&path)
-            .map_err(|error| {
-                format!(
-                    "读取 session_index.jsonl 失败 ({}): {}",
-                    path.display(),
-                    error
-                )
-            })?
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
+    let rows = collect_session_index_visible_rows(data_dir)?;
+    let visible_ids = rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<HashSet<_>>();
+    let mut seen_preserved_ids = HashSet::new();
+    let mut lines = read_session_index_lines(data_dir)?
+        .into_iter()
+        .filter(|line| {
+            let Ok(entry) = serde_json::from_str::<JsonValue>(line.trim()) else {
+                return true;
+            };
+            let Some(id) = entry.get("id").and_then(JsonValue::as_str) else {
+                return true;
+            };
+            if visible_ids.contains(id) {
+                return false;
+            }
+            seen_preserved_ids.insert(id.to_string())
+        })
+        .collect::<Vec<_>>();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
 
-    for row in &missing_rows {
+    for row in &rows {
         let entry = build_session_index_entry_from_thread(row);
         let line = serde_json::to_string(&entry)
             .map_err(|error| format!("序列化 session_index 条目失败: {}", error))?;
@@ -722,6 +961,7 @@ fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<usize, String>
 
     let mut output = lines.join("\n");
     output.push('\n');
+    let path = data_dir.join(SESSION_INDEX_FILE);
     modules::atomic_write::write_string_atomic(&path, &output).map_err(|error| {
         format!(
             "写入 session_index.jsonl 失败 ({}): {}",
@@ -729,7 +969,192 @@ fn reconcile_session_index_from_sqlite(data_dir: &Path) -> Result<usize, String>
             error
         )
     })?;
-    Ok(missing_rows.len())
+    Ok((drift.missing_entries, drift.updated_entries))
+}
+
+fn is_user_visible_thread_row(row: &SqliteThreadIndexRow) -> bool {
+    if row.archived.unwrap_or_default() != 0 {
+        return false;
+    }
+    if row.cwd.as_deref().unwrap_or_default().trim().is_empty() {
+        return false;
+    }
+    if row.has_first_user_message_column
+        && row
+            .first_user_message
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        return false;
+    }
+    !row.has_thread_source_column
+        || row.thread_source.as_deref().unwrap_or_default().trim() == "user"
+}
+
+fn collect_user_visible_thread_project_rows(
+    data_dir: &Path,
+) -> Result<Vec<SqliteThreadIndexRow>, String> {
+    Ok(load_sqlite_thread_index_rows(data_dir)?
+        .into_iter()
+        .filter(is_user_visible_thread_row)
+        .collect())
+}
+
+fn global_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(GLOBAL_STATE_FILE)
+}
+
+fn read_global_state(data_dir: &Path) -> Result<JsonValue, String> {
+    let path = global_state_path(data_dir);
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取全局状态失败 ({}): {}", path.display(), error))?;
+    if content.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<JsonValue>(&content)
+        .map_err(|error| format!("解析全局状态失败 ({}): {}", path.display(), error))
+}
+
+fn write_global_state(data_dir: &Path, value: &JsonValue) -> Result<(), String> {
+    let path = global_state_path(data_dir);
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("序列化全局状态失败: {}", error))?;
+    modules::atomic_write::write_string_atomic(&path, &format!("{}\n", content))
+        .map_err(|error| format!("写入全局状态失败 ({}): {}", path.display(), error))
+}
+
+fn merge_global_state_string_array(
+    object: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    additions: &[String],
+) -> bool {
+    let mut changed = false;
+    let mut values = object
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| item.as_str().map(|value| value.trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut existing = values.iter().cloned().collect::<HashSet<_>>();
+
+    for addition in additions {
+        let trimmed = addition.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if existing.insert(trimmed.to_string()) {
+            values.push(trimmed.to_string());
+            changed = true;
+        }
+    }
+
+    if changed {
+        object.insert(
+            key.to_string(),
+            JsonValue::Array(values.into_iter().map(JsonValue::String).collect()),
+        );
+    }
+    changed
+}
+
+fn thread_project_assignment_for_row(row: &SqliteThreadIndexRow) -> Option<JsonValue> {
+    let cwd = row.cwd.as_deref()?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "projectKind": "local",
+        "projectId": cwd,
+        "path": cwd,
+        "cwd": cwd,
+        "pendingCoreUpdate": false,
+    }))
+}
+
+fn count_missing_thread_project_assignments(data_dir: &Path) -> Result<usize, String> {
+    let rows = collect_user_visible_thread_project_rows(data_dir)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let state = read_global_state(data_dir)?;
+    let assignments = state
+        .get(THREAD_PROJECT_ASSIGNMENTS_KEY)
+        .and_then(JsonValue::as_object);
+    Ok(rows
+        .iter()
+        .filter(|row| {
+            let Some(expected) = thread_project_assignment_for_row(row) else {
+                return false;
+            };
+            assignments
+                .and_then(|items| items.get(&row.id))
+                .map_or(true, |existing| existing != &expected)
+        })
+        .count())
+}
+
+fn reconcile_thread_project_assignments(data_dir: &Path) -> Result<usize, String> {
+    let rows = collect_user_visible_thread_project_rows(data_dir)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut state = read_global_state(data_dir)?;
+    if !state.is_object() {
+        state = json!({});
+    }
+    let Some(object) = state.as_object_mut() else {
+        return Err("全局状态文件格式无效".to_string());
+    };
+
+    let mut assignments = object
+        .get(THREAD_PROJECT_ASSIGNMENTS_KEY)
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut updated_assignments = 0usize;
+    let mut roots = Vec::new();
+
+    for row in &rows {
+        let Some(assignment) = thread_project_assignment_for_row(row) else {
+            continue;
+        };
+        let cwd = row.cwd.as_deref().unwrap_or_default().trim();
+        if !cwd.is_empty() {
+            roots.push(cwd.to_string());
+        }
+        if assignments
+            .get(&row.id)
+            .map_or(true, |existing| existing != &assignment)
+        {
+            assignments.insert(row.id.clone(), assignment);
+            updated_assignments += 1;
+        }
+    }
+
+    let mut changed = updated_assignments > 0;
+    if updated_assignments > 0 {
+        object.insert(
+            THREAD_PROJECT_ASSIGNMENTS_KEY.to_string(),
+            JsonValue::Object(assignments),
+        );
+    }
+    changed |= merge_global_state_string_array(object, PROJECT_ORDER_KEY, &roots);
+    changed |= merge_global_state_string_array(object, ELECTRON_SAVED_WORKSPACE_ROOTS_KEY, &roots);
+
+    if changed {
+        write_global_state(data_dir, &state)?;
+    }
+
+    Ok(updated_assignments)
 }
 
 fn normalize_codex_timestamp_ms(timestamp: i64) -> i128 {
@@ -1230,6 +1655,7 @@ fn backup_instance_files(
     rollout_changes: &[RolloutProviderChange],
     include_sqlite: bool,
     include_session_index: bool,
+    include_global_state: bool,
     instance_id: &str,
     target_provider: &str,
 ) -> Result<PathBuf, String> {
@@ -1275,6 +1701,28 @@ fn backup_instance_files(
         sqlite_backup_created = backup_sqlite_database(data_dir, &backup_dir)?;
     }
 
+    let mut global_state_backup_created = false;
+    if include_global_state {
+        let source = data_dir.join(GLOBAL_STATE_FILE);
+        if source.exists() {
+            let target = backup_dir.join("files").join(GLOBAL_STATE_FILE);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!("创建全局状态备份目录失败 ({}): {}", parent.display(), error)
+                })?;
+            }
+            fs::copy(&source, &target).map_err(|error| {
+                format!(
+                    "备份全局状态失败 ({} -> {}): {}",
+                    source.display(),
+                    target.display(),
+                    error
+                )
+            })?;
+            global_state_backup_created = true;
+        }
+    }
+
     let mut session_index_backup_created = false;
     if include_session_index {
         let source = data_dir.join(SESSION_INDEX_FILE);
@@ -1308,6 +1756,7 @@ fn backup_instance_files(
         "createdAt": Utc::now().to_rfc3339(),
         "hasSqliteBackup": sqlite_backup_created,
         "hasSessionIndexBackup": session_index_backup_created,
+        "hasGlobalStateBackup": global_state_backup_created,
         "rolloutFiles": backed_up_files,
     });
     fs::write(
@@ -1418,6 +1867,7 @@ fn restore_instance_files_from_backup(
     data_dir: &Path,
     backup_dir: &Path,
     include_sqlite: bool,
+    _include_global_state: bool,
 ) -> Result<(), String> {
     let files_root = backup_dir.join("files");
     if files_root.exists() {
@@ -1524,7 +1974,8 @@ mod tests {
             collect_rollout_provider_changes(&data_dir, "relay").expect("collect rollout changes");
         assert_eq!(changes.len(), 1);
 
-        repair_single_instance(&data_dir, "relay", &changes, false, false).expect("repair rollout");
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
+            .expect("repair rollout");
 
         let content = fs::read_to_string(&rollout_path).expect("read repaired rollout");
         assert!(content.contains("\"model_provider\":\"relay\""));
@@ -1558,7 +2009,7 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert!(changes[0].updated_first_line.is_none());
 
-        repair_single_instance(&data_dir, "relay", &changes, false, false)
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
             .expect("repair rollout time");
 
         assert_eq!(
@@ -1572,6 +2023,35 @@ mod tests {
                 .expect("rollout mtime"),
             UNIX_EPOCH + Duration::from_secs(1_704_067_200)
         );
+        fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rollout_repair_marks_interactive_session_meta_with_missing_thread_source() {
+        let data_dir = make_temp_dir("codex-session-visibility-thread-source-test");
+        let rollout_dir = data_dir.join("sessions").join("2026").join("05").join("23");
+        fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+        let rollout_path = rollout_dir.join("rollout-test.jsonl");
+        fs::write(
+            &rollout_path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"source\":\"vscode\",\"model_provider\":\"relay\"}}\n{\"type\":\"event\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n",
+        )
+        .expect("write rollout");
+
+        let changes =
+            collect_rollout_provider_changes(&data_dir, "relay").expect("collect rollout changes");
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0]
+            .updated_first_line
+            .as_deref()
+            .expect("updated first line")
+            .contains("\"thread_source\":\"user\""));
+
+        repair_single_instance(&data_dir, "relay", &changes, false, false, false)
+            .expect("repair rollout thread source");
+
+        let content = fs::read_to_string(&rollout_path).expect("read repaired rollout");
+        assert!(content.contains("\"thread_source\":\"user\""));
         fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
     }
 
@@ -1714,8 +2194,9 @@ mod tests {
             .expect("insert old row");
         drop(connection);
 
-        let backup_dir = backup_instance_files(&data_dir, &[], true, false, "default", "relay")
-            .expect("backup db");
+        let backup_dir =
+            backup_instance_files(&data_dir, &[], true, false, false, "default", "relay")
+                .expect("backup db");
 
         let connection = Connection::open(&db_path).expect("reopen sqlite");
         connection
@@ -1729,7 +2210,8 @@ mod tests {
             fs::write(path, b"stale wal/shm").expect("write stale sidecar");
         }
 
-        restore_instance_files_from_backup(&data_dir, &backup_dir, true).expect("restore db");
+        restore_instance_files_from_backup(&data_dir, &backup_dir, true, false)
+            .expect("restore db");
         for path in sqlite_sidecar_paths(&db_path) {
             assert!(
                 !path.exists(),
@@ -1752,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn session_index_repair_appends_missing_sqlite_threads() {
+    fn session_index_repair_rebuilds_visible_threads_at_tail() {
         let data_dir = make_temp_dir("codex-session-visibility-index-test");
         let db_path = data_dir.join(STATE_DB_FILE);
         let connection = Connection::open(&db_path).expect("open sqlite");
@@ -1761,16 +2243,17 @@ mod tests {
                 "CREATE TABLE threads (
                     id TEXT PRIMARY KEY,
                     title TEXT,
-                    updated_at INTEGER
+                    updated_at INTEGER,
+                    updated_at_ms INTEGER
                 )",
                 [],
             )
             .expect("create threads table");
         connection
             .execute(
-                "INSERT INTO threads (id, title, updated_at) VALUES
-                 ('indexed-thread', 'Indexed', 1_700_000_000),
-                 ('missing-thread', 'Missing chat', 1_800_000_000)",
+                "INSERT INTO threads (id, title, updated_at, updated_at_ms) VALUES
+                 ('indexed-thread', 'Indexed', 1_700_000_000, 1_700_000_000_123),
+                 ('missing-thread', 'Missing chat', 1_800_000_000, 1_800_000_000_456)",
                 [],
             )
             .expect("insert rows");
@@ -1778,18 +2261,24 @@ mod tests {
 
         fs::write(
             data_dir.join(SESSION_INDEX_FILE),
-            "{\"id\":\"indexed-thread\",\"thread_name\":\"Indexed\",\"updated_at\":\"2024-01-01T00:00:00.0000000Z\"}\n",
+            "{\"id\":\"preserved-thread\",\"thread_name\":\"Preserved\",\"updated_at\":\"2024-01-01T00:00:00.0000000Z\"}\n{\"id\":\"indexed-thread\",\"thread_name\":\"Stale\",\"updated_at\":\"2024-01-01T00:00:00.0000000Z\"}\n",
         )
         .expect("write session index");
 
         let missing =
             count_missing_session_index_entries(&data_dir).expect("count missing index entries");
         assert_eq!(missing, 1);
+        let drift = count_session_index_drift(&data_dir).expect("count index drift");
+        assert_eq!(drift.missing_entries, 1);
+        assert_eq!(drift.updated_entries, 1);
 
-        let added = reconcile_session_index_from_sqlite(&data_dir).expect("reconcile index");
+        let (added, updated) =
+            reconcile_session_index_from_sqlite(&data_dir).expect("reconcile index");
         assert_eq!(added, 1);
+        assert_eq!(updated, 1);
 
         let index_map = read_session_index_map(&data_dir).expect("read session index");
+        assert!(index_map.contains_key("preserved-thread"));
         assert!(index_map.contains_key("missing-thread"));
         assert_eq!(
             index_map
@@ -1799,7 +2288,110 @@ mod tests {
             Some("Missing chat")
         );
         assert_eq!(
+            index_map
+                .get("missing-thread")
+                .and_then(|entry| entry.get("updated_at"))
+                .and_then(JsonValue::as_str),
+            Some("2027-01-15T08:00:00.456000Z")
+        );
+        let lines = read_session_index_lines(&data_dir).expect("read rebuilt index");
+        let ids = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<JsonValue>(line)
+                    .expect("valid index json")
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .expect("id")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "preserved-thread".to_string(),
+                "indexed-thread".to_string(),
+                "missing-thread".to_string(),
+            ]
+        );
+        assert_eq!(
             count_missing_session_index_entries(&data_dir).expect("recount missing index entries"),
+            0
+        );
+        assert!(!count_session_index_drift(&data_dir)
+            .expect("recount index drift")
+            .needs_repair());
+
+        fs::remove_dir_all(&data_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn global_state_repair_adds_thread_project_assignments_for_visible_threads() {
+        let data_dir = make_temp_dir("codex-session-visibility-project-assignment-test");
+        let db_path = data_dir.join(STATE_DB_FILE);
+        let connection = Connection::open(&db_path).expect("open sqlite");
+        connection
+            .execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    updated_at INTEGER,
+                    cwd TEXT,
+                    archived INTEGER,
+                    first_user_message TEXT,
+                    thread_source TEXT
+                )",
+                [],
+            )
+            .expect("create threads table");
+        connection
+            .execute(
+                "INSERT INTO threads (id, title, updated_at, cwd, archived, first_user_message, thread_source)
+                 VALUES
+                 ('visible-thread', 'Visible', 1_800_000_000, '/tmp/project-a', 0, 'hello', 'user'),
+                 ('archived-thread', 'Archived', 1_800_000_001, '/tmp/project-b', 1, 'hello', 'user'),
+                 ('system-thread', 'System', 1_800_000_002, '/tmp/project-c', 0, 'hello', 'system')",
+                [],
+            )
+            .expect("insert rows");
+        drop(connection);
+
+        fs::write(
+            data_dir.join(GLOBAL_STATE_FILE),
+            "{\"project-order\":[],\"electron-saved-workspace-roots\":[]}\n",
+        )
+        .expect("write global state");
+
+        let missing = count_missing_thread_project_assignments(&data_dir)
+            .expect("count missing project assignments");
+        assert_eq!(missing, 1);
+
+        let updated =
+            reconcile_thread_project_assignments(&data_dir).expect("reconcile project assignments");
+        assert_eq!(updated, 1);
+
+        let state = read_global_state(&data_dir).expect("read global state");
+        let assignments = state
+            .get(THREAD_PROJECT_ASSIGNMENTS_KEY)
+            .and_then(JsonValue::as_object)
+            .expect("project assignments");
+        let assignment = assignments
+            .get("visible-thread")
+            .and_then(JsonValue::as_object)
+            .expect("visible assignment");
+        assert_eq!(
+            assignment.get("projectKind").and_then(JsonValue::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            assignment.get("projectId").and_then(JsonValue::as_str),
+            Some("/tmp/project-a")
+        );
+        assert!(!assignments.contains_key("archived-thread"));
+        assert!(!assignments.contains_key("system-thread"));
+        assert_eq!(
+            count_missing_thread_project_assignments(&data_dir)
+                .expect("recount missing project assignments"),
             0
         );
 
